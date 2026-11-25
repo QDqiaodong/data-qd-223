@@ -16,14 +16,16 @@ semantics of the wrapped router.
 
 Only the standard library is used.
 """
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Mapping
+import math
 import re
 import threading
 
-from router import Router, Unavailable
+from router import DeadlineExceeded, Router, Unavailable
 
-__all__ = ["OutageRouter", "NoFeasiblePlan", "Unavailable"]
+__all__ = ["OutageRouter", "NoFeasiblePlan", "DeadlineExceeded",
+           "Unavailable"]
 
 
 class NoFeasiblePlan(Exception):
@@ -48,6 +50,99 @@ def _valid_id(value):
 
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _finite_positive(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+_MAX_CACHED_PATH = 2048
+_CACHE_LIMIT = 128
+_WAIT_POLL_SECONDS = 0.005
+_ETAG_RE = re.compile(rb'^"[A-Za-z0-9._-]{1,64}"\Z')
+_MAX_AGE_RE = re.compile(rb"^max-age=([0-9]+)\Z", re.IGNORECASE)
+
+
+class _CacheEntry:
+    __slots__ = ("body", "etag", "max_age", "expires_at")
+
+    def __init__(self, body, etag, max_age, expires_at):
+        self.body = body
+        self.etag = etag
+        self.max_age = max_age
+        self.expires_at = expires_at
+
+    def fresh(self, now):
+        return now < self.expires_at
+
+
+class _Flight:
+    """One actual origin exchange for one cache identity."""
+
+    __slots__ = ("entry", "done", "kind", "status", "body", "error", "max_age")
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.done = False
+        self.kind = None  # shared | private | error | abandoned
+        self.status = None
+        self.body = None
+        self.error = None
+        self.max_age = None
+
+
+def _parse_max_age(headers):
+    values = headers.get(b"cache-control", ())
+    if len(values) != 1:
+        return None
+    match = _MAX_AGE_RE.fullmatch(values[0].strip())
+    if match is None:
+        return None
+    digits = match.group(1).lstrip(b"0") or b"0"
+    if len(digits) > 4:
+        return None
+    max_age = int(digits)
+    if not 1 <= max_age <= 3600:
+        return None
+    return max_age
+
+
+def _parse_strong_etag(headers):
+    values = headers.get(b"etag", ())
+    if len(values) != 1:
+        return None
+    etag = values[0].strip()
+    if _ETAG_RE.fullmatch(etag) is None:
+        return None
+    return etag
+
+
+def _vary_allows_language_only(headers):
+    values = headers.get(b"vary")
+    if not values:
+        return True
+    tokens = []
+    for value in values:
+        tokens.extend(part.strip().lower() for part in value.split(b","))
+    tokens = [token for token in tokens if token]
+    return bool(tokens) and all(token == b"accept-language" for token in tokens)
+
+
+def _shared_200_metadata(headers):
+    if headers.get(b"set-cookie"):
+        return None
+    max_age = _parse_max_age(headers)
+    if max_age is None:
+        return None
+    etag = _parse_strong_etag(headers)
+    if etag is None or not _vary_allows_language_only(headers):
+        return None
+    return etag, max_age
 
 
 class _Plan:
@@ -196,6 +291,14 @@ class OutageRouter:
         self._install_lock = threading.Lock()
         self._plan = None
         self._revision = 0
+
+        # Cache state is guarded by one condition.  Network I/O is always
+        # performed outside the lock so an in-flight identity cannot block
+        # hits for unrelated identities.
+        self._cache_condition = threading.Condition()
+        self._cache = OrderedDict()
+        self._in_flight = {}
+        self._cache_waiter_count = 0
 
     # ------------------------------------------------------------------
     # Plan approval
@@ -354,3 +457,265 @@ class OutageRouter:
         else:
             endpoint = self._site_endpoint[primary]
         return self.router.get_from(endpoint, path, budget=budget)
+
+    # ------------------------------------------------------------------
+    # Shared cached GET
+    # ------------------------------------------------------------------
+    def get_cached(self, bucket, path, *, budget, language="zh",
+                   outage_zone=None):
+        """GET a public resource, coalescing identical origins and caching 200s.
+
+        Returns the same ``(status, body)`` pair as :meth:`get`.  Only qualified
+        200 responses are resident cache entries; revalidation uses a strong
+        ETag.  Waiting callers share one in-flight origin exchange.
+        """
+        plan = self._plan
+        if plan is None:
+            raise Unavailable(path)
+        if not _is_int(bucket) or bucket not in plan.by_bucket:
+            raise ValueError("bucket is not part of the approved plan")
+        if outage_zone is not None:
+            if not isinstance(outage_zone, str) \
+                    or outage_zone not in plan.zones:
+                raise ValueError("outage zone is not in the site directory")
+
+        primary, zone, backup = plan.by_bucket[bucket]
+        if outage_zone is not None and outage_zone == zone:
+            endpoint = self._site_endpoint[backup]
+        else:
+            endpoint = self._site_endpoint[primary]
+
+        if language not in ("zh", "en"):
+            raise ValueError("language must be 'zh' or 'en'")
+        if not _finite_positive(budget):
+            raise ValueError("budget must be a finite positive number")
+        if (not isinstance(path, str)
+                or len(path) > _MAX_CACHED_PATH
+                or not Router._valid_deadline_path(path)):
+            raise ValueError("expected a local ASCII path of at most 2048 chars")
+
+        # The cached entry is still one router call for purposes of the
+        # instance-wide 32-call limit.  Waiting therefore occupies a call slot
+        # but never an endpoint/origin slot.
+        deadline = self.router.clock() + budget
+        self.router._acquire_call_slot(path)
+        try:
+            identity = (bucket, endpoint, path, language)
+            return self._cached_wait_or_fetch(
+                identity, endpoint, path, language, deadline)
+        finally:
+            self.router._release_call_slot()
+
+    def _cached_wait_or_fetch(self, identity, endpoint, path, language,
+                              deadline):
+        observed = None
+        while True:
+            leader = None
+            with self._cache_condition:
+                while True:
+                    now = self.router.clock()
+                    if now >= deadline:
+                        raise DeadlineExceeded(path)
+
+                    # A terminal flight belonging to this call must be handled
+                    # before looking for a successor in the identity map.  This
+                    # preserves an upstream failure verdict for every member of
+                    # the original batch.
+                    if observed is not None and observed.done:
+                        if observed.kind == "error":
+                            raise observed.error
+                        if observed.kind == "shared":
+                            return 200, observed.body
+                        # private/abandoned: this caller may compete to continue.
+                        observed = None
+                        continue
+
+                    entry = self._cache.get(identity)
+                    if entry is not None and entry.fresh(now):
+                        self._cache.move_to_end(identity)
+                        return 200, entry.body
+
+                    current = self._in_flight.get(identity)
+                    if current is None:
+                        leader = _Flight(entry)
+                        self._in_flight[identity] = leader
+                        observed = leader
+                        break
+
+                    observed = current
+                    if current.done:
+                        continue
+                    remaining = deadline - now
+                    self._cache_waiter_count += 1
+                    try:
+                        self._cache_condition.wait(
+                            timeout=min(
+                                _WAIT_POLL_SECONDS, max(0.0, remaining)))
+                    finally:
+                        self._cache_waiter_count -= 1
+
+            return self._run_cache_leader(
+                leader, identity, endpoint, path, language, deadline)
+
+    def _run_cache_leader(self, flight, identity, endpoint, path, language,
+                          deadline):
+        clock = self.router.clock
+        now = clock()
+        if now >= deadline:
+            self._abandon_flight(identity, flight)
+            raise DeadlineExceeded(path)
+
+        entry = flight.entry
+        request_headers = [("Accept-Language", language)]
+        validator = None
+        if entry is not None:
+            request_headers.append(
+                ("If-None-Match", entry.etag.decode("ascii")))
+
+            def validator(status, headers, _body):
+                if status != 304:
+                    return True
+                max_age = self._valid_304_metadata(headers, entry)
+                if max_age is None:
+                    return False
+                flight.max_age = max_age
+                return True
+
+        remaining = deadline - now
+        try:
+            status, body, headers = self.router.request_from(
+                endpoint, path, budget=remaining,
+                extra_headers=request_headers,
+                allow_empty_not_modified=True,
+                response_validator=validator,
+                call_already_admitted=True)
+        except DeadlineExceeded:
+            # The initiating caller's deadline cancels only this origin
+            # exchange.  Its socket and endpoint token have already been
+            # closed/released by Router before the exception arrives.
+            self._abandon_flight(identity, flight)
+            raise
+        except Unavailable as exc:
+            self._fail_flight(identity, flight, exc)
+            if clock() >= deadline:
+                raise DeadlineExceeded(path) from exc
+            raise
+        except BaseException as exc:  # defensive: never strand batch waiters
+            self._fail_flight(identity, flight, exc)
+            raise
+
+        confirmed_at = clock()
+        caller_expired = confirmed_at >= deadline
+
+        if status == 304:
+            max_age = flight.max_age
+            if entry is None or max_age is None:
+                error = Unavailable(path)
+                self._fail_flight(identity, flight, error)
+                if caller_expired:
+                    raise DeadlineExceeded(path) from error
+                raise error
+
+            body = entry.body
+            with self._cache_condition:
+                entry.expires_at = confirmed_at + max_age
+                self._cache[identity] = entry
+                self._cache.move_to_end(identity)
+                self._evict_cache_locked()
+                self._finish_shared_locked(identity, flight, body)
+            if caller_expired:
+                raise DeadlineExceeded(path)
+            return 200, body
+
+        metadata = _shared_200_metadata(headers) if status == 200 else None
+        if metadata is not None:
+            etag, max_age = metadata
+            cached = _CacheEntry(
+                body, etag, max_age, confirmed_at + max_age)
+            with self._cache_condition:
+                self._cache[identity] = cached
+                self._cache.move_to_end(identity)
+                self._evict_cache_locked()
+                self._finish_shared_locked(identity, flight, body)
+            if caller_expired:
+                raise DeadlineExceeded(path)
+            return status, body
+
+        # A deliverable but non-shareable response is private to this actual
+        # permitted origin caller.  It must not be broadcast or retained.
+        with self._cache_condition:
+            self._cache.pop(identity, None)
+            if caller_expired:
+                self._finish_abandoned_locked(identity, flight)
+            else:
+                self._finish_private_locked(
+                    identity, flight, status, body)
+        if caller_expired:
+            raise DeadlineExceeded(path)
+        return status, body
+
+    @staticmethod
+    def _valid_304_metadata(headers, entry):
+        max_age = _parse_max_age(headers)
+        etag = _parse_strong_etag(headers)
+        if max_age is None or etag != entry.etag:
+            return None
+        if headers.get(b"set-cookie"):
+            return None
+        if not _vary_allows_language_only(headers):
+            return None
+
+        values = headers.get(b"content-length")
+        if values is not None:
+            if len(values) != 1:
+                return None
+            value = values[0].strip()
+            if not value.isdigit():
+                return None
+            digits = value.lstrip(b"0") or b"0"
+            if len(digits) > len(str(Router._MAX_BODY_BYTES)):
+                return None
+            if int(digits) != len(entry.body):
+                return None
+        return max_age
+
+    def _evict_cache_locked(self):
+        while len(self._cache) > _CACHE_LIMIT:
+            self._cache.popitem(last=False)
+
+    def _finish_shared_locked(self, identity, flight, body):
+        if self._in_flight.get(identity) is flight:
+            del self._in_flight[identity]
+        flight.kind = "shared"
+        flight.body = body
+        flight.done = True
+        self._cache_condition.notify_all()
+
+    def _finish_private_locked(self, identity, flight, status, body):
+        if self._in_flight.get(identity) is flight:
+            del self._in_flight[identity]
+        flight.kind = "private"
+        flight.status = status
+        flight.body = body
+        flight.done = True
+        self._cache_condition.notify_all()
+
+    def _finish_abandoned_locked(self, identity, flight):
+        if self._in_flight.get(identity) is flight:
+            del self._in_flight[identity]
+        flight.kind = "abandoned"
+        flight.done = True
+        self._cache_condition.notify_all()
+
+    def _abandon_flight(self, identity, flight):
+        with self._cache_condition:
+            self._finish_abandoned_locked(identity, flight)
+
+    def _fail_flight(self, identity, flight, error):
+        with self._cache_condition:
+            if self._in_flight.get(identity) is flight:
+                del self._in_flight[identity]
+            flight.kind = "error"
+            flight.error = error
+            flight.done = True
+            self._cache_condition.notify_all()

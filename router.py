@@ -117,15 +117,14 @@ class Router:
         if not self._valid_deadline_path(path):
             raise ValueError("expected a local path")
 
-        with self._call_lock:
-            if self._active_calls >= self._MAX_CONCURRENT_CALLS:
-                raise Unavailable(path)
-            self._active_calls += 1
+        self._acquire_call_slot(path)
         try:
-            return self._get_with_deadline(path, budget)
+            result = self._get_with_deadline(path, budget)
+            # Backwards compatibility for subclasses overriding the old
+            # private helper with a two-item result.
+            return result[0], result[1]
         finally:
-            with self._call_lock:
-                self._active_calls -= 1
+            self._release_call_slot()
 
     def get_from(self, endpoint, path, *, budget):
         """Run one deadline-mode request against exactly ``endpoint``.
@@ -134,8 +133,15 @@ class Router:
         failover happen, so a failure of ``endpoint`` follows the ordinary
         single-candidate error semantics rather than being retried elsewhere.
         """
+        status, body, _ = self.request_from(endpoint, path, budget=budget)
+        return status, body
+
+    def request_from(self, endpoint, path, *, budget, extra_headers=(),
+                     allow_empty_not_modified=False, response_validator=None,
+                     call_already_admitted=False):
+        """Like :meth:`get_from`, but return headers and support cache revalidation."""
         if not self.deadline_mode:
-            raise ValueError("get_from requires deadline_mode=True")
+            raise ValueError("request_from requires deadline_mode=True")
         if not isinstance(endpoint, (tuple, list)) or len(endpoint) != 2:
             raise ValueError("endpoint must be one of the router's endpoints")
         endpoint = tuple(endpoint)
@@ -146,16 +152,27 @@ class Router:
         if not self._valid_deadline_path(path):
             raise ValueError("expected a local path")
 
+        if not call_already_admitted:
+            self._acquire_call_slot(path)
+        try:
+            return self._get_with_deadline(
+                path, budget, endpoints=(endpoint,),
+                extra_headers=tuple(extra_headers),
+                allow_empty_not_modified=allow_empty_not_modified,
+                response_validator=response_validator)
+        finally:
+            if not call_already_admitted:
+                self._release_call_slot()
+
+    def _acquire_call_slot(self, path):
         with self._call_lock:
             if self._active_calls >= self._MAX_CONCURRENT_CALLS:
                 raise Unavailable(path)
             self._active_calls += 1
-        try:
-            return self._get_with_deadline(
-                path, budget, endpoints=(endpoint,))
-        finally:
-            with self._call_lock:
-                self._active_calls -= 1
+
+    def _release_call_slot(self):
+        with self._call_lock:
+            self._active_calls -= 1
 
     # ------------------------------------------------------------------
     # Original mode
@@ -188,7 +205,9 @@ class Router:
     # ------------------------------------------------------------------
     # Deadline mode: request orchestration
     # ------------------------------------------------------------------
-    def _get_with_deadline(self, path, budget, endpoints=None):
+    def _get_with_deadline(self, path, budget, endpoints=None, *,
+                           extra_headers=(), allow_empty_not_modified=False,
+                           response_validator=None):
         request_deadline = self.clock() + budget
 
         if endpoints is None:
@@ -211,8 +230,16 @@ class Router:
 
             try:
                 try:
-                    status, body = self._attempt(
-                        endpoint, path, request_deadline)
+                    status, body, response_headers = self._attempt(
+                        endpoint, path, request_deadline,
+                        extra_headers=extra_headers,
+                        allow_empty_not_modified=allow_empty_not_modified)
+                    if response_validator is not None \
+                            and response_validator(
+                                status, response_headers, body) is False:
+                        # A response that violates the service's cache/revalidation
+                        # contract is treated like any other protocol failure.
+                        raise _UpstreamFailure(self.clock())
                 except _RequestTimeout:
                     raise DeadlineExceeded(path)
                 except _AttemptTimeout as failure:
@@ -236,7 +263,7 @@ class Router:
                     token = None
                     if self.clock() >= request_deadline:
                         raise DeadlineExceeded(path)
-                    return status, body
+                    return status, body, response_headers
             finally:
                 if token is not None:
                     self._release(endpoint, token)
@@ -245,7 +272,8 @@ class Router:
             raise DeadlineExceeded(path)
         raise Unavailable(path)
 
-    def _attempt(self, endpoint, path, request_deadline):
+    def _attempt(self, endpoint, path, request_deadline, *,
+                 extra_headers=(), allow_empty_not_modified=False):
         """Run one real attempt, closing its socket before returning/raising."""
         now = self.clock()
         attempt_deadline = now + self.timeout
@@ -258,13 +286,15 @@ class Router:
             connection = self._connect(
                 endpoint, attempt_deadline, request_deadline)
             self._send_request(
-                connection, endpoint, path, attempt_deadline, request_deadline)
-            status, body = self._read_response(
-                connection, attempt_deadline, request_deadline)
+                connection, endpoint, path, attempt_deadline, request_deadline,
+                extra_headers=extra_headers)
+            status, body, headers = self._read_response(
+                connection, attempt_deadline, request_deadline,
+                allow_empty_not_modified=allow_empty_not_modified)
             # A complete, valid result is deliverable only if it was read
             # before the earlier of the two deadlines.
             self._check_deadlines(attempt_deadline, request_deadline)
-            return status, body
+            return status, body, headers
         finally:
             self._close_socket(connection)
 
@@ -369,14 +399,17 @@ class Router:
             raise
 
     def _send_request(self, sock, endpoint, path, attempt_deadline,
-                      request_deadline):
+                      request_deadline, *, extra_headers=()):
         host, port = endpoint
-        request = (
+        request_text = (
             "GET %s HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
-            "Connection: close\r\n"
-            "\r\n" % (path, host, port)
-        ).encode("ascii")
+            "Connection: close\r\n" % (path, host, port)
+        )
+        for name, value in extra_headers:
+            request_text += "%s: %s\r\n" % (name, value)
+        request_text += "\r\n"
+        request = request_text.encode("ascii")
         view = memoryview(request)
         while view:
             self._check_deadlines(attempt_deadline, request_deadline)
@@ -423,7 +456,8 @@ class Router:
     # ------------------------------------------------------------------
     # HTTP response parsing
     # ------------------------------------------------------------------
-    def _read_response(self, sock, attempt_deadline, request_deadline):
+    def _read_response(self, sock, attempt_deadline, request_deadline, *,
+                       allow_empty_not_modified=False):
         raw_headers, body_prefix = self._read_headers(
             sock, attempt_deadline, request_deadline)
         status, headers = self._parse_headers(
@@ -437,6 +471,29 @@ class Router:
 
         if b"transfer-encoding" in headers:
             self._protocol_failure(attempt_deadline, request_deadline)
+
+        if status == 304 and allow_empty_not_modified:
+            # A cache revalidation 304 has no body.  It may omit
+            # Content-Length or name the length of the cached representation;
+            # in the latter case that value must not cause us to wait for bytes.
+            values = headers.get(b"content-length")
+            if values is not None:
+                if not values or len(set(values)) != 1:
+                    self._protocol_failure(
+                        attempt_deadline, request_deadline)
+                value = values[0]
+                digits = value.lstrip(b"0")
+                if (not value or not value.isdigit()
+                        or len(digits) > len(str(self._MAX_BODY_BYTES))):
+                    self._protocol_failure(
+                        attempt_deadline, request_deadline)
+                length = int(digits or b"0")
+                if length > self._MAX_BODY_BYTES:
+                    self._protocol_failure(
+                        attempt_deadline, request_deadline)
+            self._check_deadlines(attempt_deadline, request_deadline)
+            return status, b"", headers
+
         values = headers.get(b"content-length")
         if not values or len(set(values)) != 1:
             self._protocol_failure(attempt_deadline, request_deadline)
@@ -466,7 +523,7 @@ class Router:
             body.extend(chunk)
 
         self._check_deadlines(attempt_deadline, request_deadline)
-        return status, bytes(body)
+        return status, bytes(body), headers
 
     def _read_headers(self, sock, attempt_deadline, request_deadline):
         buffer = bytearray()

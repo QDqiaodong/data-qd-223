@@ -16,6 +16,8 @@ class Connection:
         self.server = server
         self.sock = sock
         self.path = None
+        self.raw_request = b""
+        self.request_headers = {}
         self.client_closed = threading.Event()
         self.closed_at = None
         self._lock = threading.Lock()
@@ -148,6 +150,17 @@ class FixtureServer(AbstractContextManager):
             line = request.split(b"\r\n", 1)[0].decode("latin-1")
             parts = line.split(" ")
             connection.path = parts[1] if len(parts) > 1 else ""
+            connection.raw_request = request
+            headers = {}
+            for header_line in request.split(b"\r\n")[1:]:
+                if not header_line:
+                    break
+                name, separator, value = header_line.partition(b":")
+                if separator:
+                    headers.setdefault(
+                        name.strip().lower().decode("latin-1"), []
+                    ).append(value.strip().decode("latin-1"))
+            connection.request_headers = headers
             with self.lock:
                 self.paths.append(connection.path)
             with self.lock:

@@ -91,9 +91,54 @@ status, body = gateway.get(0, "/content", budget=0.45,
   安装返回后发起的 GET 使用新版本，已开始的 GET 仍使用旧版本选定的站点。
 - `install` 由单个发布者调用，可与最多 32 个并发 GET 同时进行。
 
+## 可共享正文缓存与同批回源
+
+`OutageRouter.get_cached(bucket, path, *, budget, language="zh", outage_zone=None)`
+返回与旧入口相同的 `(status, body)`，但会在实例内缓存符合本服务约定的公开
+200，并合并同一身份的并发回源：
+
+```python
+status, body = gateway.get_cached(
+    0, "/public/hot?lang=zh",
+    budget=0.45,
+    language="zh",          # 仅 "zh" 或 "en"，发送对应 Accept-Language
+    outage_zone="east",
+)
+```
+
+- 缓存与在途请求的完整身份是
+  `(bucket, 实际选定的 endpoint, 原样 path（含查询串）, language)`。
+  换站、换语言、换桶或改路径都不会借用另一身份的正文、ETag 或在途结果；
+  只改计划版本但实际目标 endpoint 不变时仍属于同一身份。
+- `path` 沿用原入口的本地 ASCII 路径校验，另限至多 2048 个字符且不改写查询串；
+  `budget` 必须是有限正数。无计划仍抛 `Unavailable`，非法桶、故障区、路径、
+  语言或预算抛 `ValueError`，且不会发包。
+- 实例内最多驻留 128 个条目（LRU 替换），不做磁盘或跨进程共享。新鲜命中不回源、
+  不占 endpoint 槽；新鲜期使用注入给 `Router` 的同一单调时钟，从完整响应确认时
+  起算，`now >= expires_at` 即视为过期。
+- 只有同时满足以下条件的 200 才可共享：正文完整且不超过 64 KiB；恰好一条
+  `Cache-Control: max-age=1..3600` 且 `max-age` 是唯一指令；一条带双引号的强
+  ETag（标签字符为 `A-Za-z0-9._-`，长度 1–64）；无 `Set-Cookie`；`Vary` 缺失或
+  仅含 `Accept-Language`。字段名/指令名大小写不敏感。
+- 过期条目存在时发送 `If-None-Match: <原 ETag>`。合法 304 必须带同一强标签、
+  有效 `max-age` 以及相同的 `Vary`/`Set-Cookie` 约束；304 无正文，可无
+  `Content-Length`，或只有一条等于原正文长度的 `Content-Length`（网关不会等待
+  该正文）。成功 304 续用原正文并更新新鲜期。冷请求收到 304、标签不符或约定
+  不满足均按单站协议失败处理。
+- `no-store` 等不可共享但可交付的 200，以及 404 等其他最终非 5xx，只返回给实际
+  完成该次回源的调用方，删除该身份旧条目，不缓存也不广播；同批其他仍有预算的
+  调用会重新竞争一次接续回源。
+- 同一身份同一时刻只有一次真实 HTTP 交换；跟随者用各自剩余预算等待。已确认的
+  上游失败可通知同批未过期调用方；单个等待者超时不影响在途请求。若发起者预算
+  先到期，Router 会按原有“请求截止优先、不记冷却”的规则关闭该次尝试；其他调用
+  可在旧 endpoint token/套接字清理后接续。所有回源仍经过 `Router` 的真实 HTTP
+  传输、尝试时限、每 endpoint 单尝试、32 调用上限和冷却规则；未另起后台刷新任务。
+
 ## 运行
 
 Python 3.9+，仅标准库。演示在回环地址启动两个临时真实上游，测试不访问外网。
+`test_cache_gateway.py` 使用可控时钟和事件门闩覆盖缓存命中、条件 304、同批合并、
+私有 `no-store`、失败清理、128 条上限和截止时间接续。
 
 ```sh
 python3 -B -m unittest -v
