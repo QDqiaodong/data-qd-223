@@ -41,6 +41,56 @@ except Unavailable as exc:
 
 回归测试覆盖：预算超时停止慢速滴流并关闭连接且不进入冷却；并发下占用中的上游不被再次拨号；尝试超时后在预算内切换、冷却、冷却后的完整 404；受控时钟下的截止相等与迟到事件隔离；5xx 响应头阻塞时仍能切换；各类无效响应。
 
+## 单可用区故障接管
+
+`outage_router.OutageRouter(router, sites)` 在已按 `deadline_mode=True` 构造的
+`Router` 之上按发布侧核准的容量计划发送请求。原 `router.get(path, budget=...)`
+保持不变，可与新入口并存。
+
+```python
+from router import Router
+from outage_router import OutageRouter, NoFeasiblePlan
+
+router = Router([("10.0.0.11", 8080), ("10.0.0.12", 8080),
+                 ("10.0.0.21", 8080), ("10.0.0.22", 8080)],
+                clock=time.monotonic, cooldown=5.0, timeout=0.5,
+                deadline_mode=True)
+gateway = OutageRouter(router, {
+    "east-1":  ("east",  ("10.0.0.11", 8080)),   # 2–16 个站点，至少两个区
+    "east-2":  ("east",  ("10.0.0.12", 8080)),
+    "north-1": ("north", ("10.0.0.21", 8080)),
+    "west-1":  ("west",  ("10.0.0.22", 8080)),
+})
+
+revision, assignments = gateway.install(
+    {                                  # 1–4096 个桶，键 0–4095
+        0: ("east-1", ["north-1", "west-1"]),  # 主站 + 至多 15 个合格站
+        1: ("east-2", ["north-1"]),
+    },
+    {"east-1": 0, "east-2": 0, "north-1": 1, "west-1": 1},  # 备用桶数
+)
+status, body = gateway.get(0, "/content", budget=0.45,
+                           outage_zone="east")   # 0→west-1，1→north-1
+```
+
+- `install` 整体替换部署方案：结构不合法抛 `ValueError`；配置合法但某个区的
+  全部主站桶无法由区外合格站按 `spare` 完整接住时抛 `NoFeasiblePlan`。失败不
+  消耗版本、不切换任何桶，此前版本继续服务。版本从 1 起逐次递增，成功时返回
+  `(revision, assignments)`（桶号→备用站 ID）。
+- 候选列表可以包含主站自己或同区站点（结构合法），但主站所在区故障时这些站点
+  不能用于接管。不同故障区是互斥场景：同一备用容量可在各区的独立分配中重复使用。
+  分配由最大流精确判定，不会因顺序不当误报容量不足，也不会只比较总容量。
+- 相同的逻辑配置（与映射插入顺序、候选顺序无关）得到相同的分配；返回值是副本，
+  改动输入或返回值不影响已核准计划。
+- `get(bucket, path, *, budget, outage_zone=None)`：无故障、或桶的主站不在声明
+  的故障区时只向主站发 GET；否则只向该版本为其分配的备用站发 GET。没有计划时
+  抛 `router.Unavailable`；有计划但桶未知、或故障区不在站点目录中时，在发任何
+  网络请求之前抛 `ValueError`。选定站失败按单候选语义处理（不转向同区、未分配
+  站或新版本），合法 404 原样返回。
+- 每次 `get` 在开始时就固定使用一份完整计划；`install` 不等待在途 HTTP 请求，
+  安装返回后发起的 GET 使用新版本，已开始的 GET 仍使用旧版本选定的站点。
+- `install` 由单个发布者调用，可与最多 32 个并发 GET 同时进行。
+
 ## 运行
 
 Python 3.9+，仅标准库。演示在回环地址启动两个临时真实上游，测试不访问外网。

@@ -127,6 +127,36 @@ class Router:
             with self._call_lock:
                 self._active_calls -= 1
 
+    def get_from(self, endpoint, path, *, budget):
+        """Run one deadline-mode request against exactly ``endpoint``.
+
+        This is the restricted counterpart of :meth:`get`: no rotation and no
+        failover happen, so a failure of ``endpoint`` follows the ordinary
+        single-candidate error semantics rather than being retried elsewhere.
+        """
+        if not self.deadline_mode:
+            raise ValueError("get_from requires deadline_mode=True")
+        if not isinstance(endpoint, (tuple, list)) or len(endpoint) != 2:
+            raise ValueError("endpoint must be one of the router's endpoints")
+        endpoint = tuple(endpoint)
+        if endpoint not in self._states:
+            raise ValueError("endpoint must be one of the router's endpoints")
+        if not _finite_positive(budget):
+            raise ValueError("budget must be a finite positive number")
+        if not self._valid_deadline_path(path):
+            raise ValueError("expected a local path")
+
+        with self._call_lock:
+            if self._active_calls >= self._MAX_CONCURRENT_CALLS:
+                raise Unavailable(path)
+            self._active_calls += 1
+        try:
+            return self._get_with_deadline(
+                path, budget, endpoints=(endpoint,))
+        finally:
+            with self._call_lock:
+                self._active_calls -= 1
+
     # ------------------------------------------------------------------
     # Original mode
     # ------------------------------------------------------------------
@@ -158,13 +188,18 @@ class Router:
     # ------------------------------------------------------------------
     # Deadline mode: request orchestration
     # ------------------------------------------------------------------
-    def _get_with_deadline(self, path, budget):
+    def _get_with_deadline(self, path, budget, endpoints=None):
         request_deadline = self.clock() + budget
 
-        with self._state_lock:
-            start = self.next_index
-            self.next_index = (start + 1) % len(self.endpoints)
-        order = self.endpoints[start:] + self.endpoints[:start]
+        if endpoints is None:
+            with self._state_lock:
+                start = self.next_index
+                self.next_index = (start + 1) % len(self.endpoints)
+            order = self.endpoints[start:] + self.endpoints[:start]
+        else:
+            # Restricted call: the caller already chose the only endpoint this
+            # attempt may use.  Rotation state stays untouched.
+            order = tuple(endpoints)
 
         for endpoint in order:
             if self.clock() >= request_deadline:
