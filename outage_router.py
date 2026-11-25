@@ -148,11 +148,12 @@ def _shared_200_metadata(headers):
 class _Plan:
     """One approved revision; never mutated after publication."""
 
-    __slots__ = ("by_bucket", "zones")
+    __slots__ = ("by_bucket", "zones", "revision")
 
-    def __init__(self, by_bucket, zones):
+    def __init__(self, by_bucket, zones, revision):
         self.by_bucket = by_bucket  # bucket -> (primary, zone, backup)
         self.zones = zones          # frozenset of known zone ids
+        self.revision = revision
 
 
 class _Dinic:
@@ -243,7 +244,9 @@ class OutageRouter:
     _MAX_SITES = 16
     _MIN_SITES = 2
 
-    def __init__(self, router, sites):
+    def __init__(self, router, sites, *, observe=None):
+        if observe is not None and not callable(observe):
+            raise TypeError("observe must be callable or None")
         if not isinstance(router, Router) or not router.deadline_mode:
             raise ValueError(
                 "OutageRouter requires a Router built with deadline_mode=True")
@@ -291,6 +294,7 @@ class OutageRouter:
         self._install_lock = threading.Lock()
         self._plan = None
         self._revision = 0
+        self._observe = observe
 
         # Cache state is guarded by one condition.  Network I/O is always
         # performed outside the lock so an in-flight identity cannot block
@@ -317,12 +321,12 @@ class OutageRouter:
         if infeasible:
             raise NoFeasiblePlan(infeasible)
 
-        plan = _Plan(by_bucket, self._zones)
         assignments = {
             bucket: by_bucket[bucket][2] for bucket in sorted(by_bucket)
         }
         with self._install_lock:
             revision = self._revision + 1
+            plan = _Plan(by_bucket, self._zones, revision)
             self._plan = plan
             self._revision = revision
         return revision, assignments
@@ -438,6 +442,31 @@ class OutageRouter:
     # ------------------------------------------------------------------
     # Gateway routing
     # ------------------------------------------------------------------
+    def _emit_observation(self, plan, site, started_at, outcome):
+        """Deliver one passive attribution record without affecting calls."""
+        observer = self._observe
+        if observer is None:
+            return
+        completed_at = self.router.clock()
+        latency_ms = math.floor((completed_at - started_at) * 1000)
+        if latency_ms < 0:
+            latency_ms = 0
+        elif latency_ms > 1000:
+            latency_ms = 1000
+        record = {
+            "revision": plan.revision,
+            "site": site,
+            "completed_ms": math.floor(completed_at * 1000),
+            "latency_ms": latency_ms,
+            "outcome": outcome,
+        }
+        try:
+            observer(record)
+        except Exception:
+            # A passive sink must never change the request's result or cause a
+            # retry.  In particular, do not accidentally catch BaseException.
+            pass
+
     def get(self, bucket, path, *, budget, outage_zone=None):
         """Send one GET to the site the approved plan allows for ``bucket``."""
         # Snapshot the complete plan once; an install racing with this call is
@@ -453,10 +482,29 @@ class OutageRouter:
 
         primary, zone, backup = plan.by_bucket[bucket]
         if outage_zone is not None and outage_zone == zone:
+            site = backup
             endpoint = self._site_endpoint[backup]
         else:
+            site = primary
             endpoint = self._site_endpoint[primary]
-        return self.router.get_from(endpoint, path, budget=budget)
+
+        if self._observe is None:
+            # Keep the pre-observation entry path byte-for-byte equivalent in
+            # behavior, including making the first clock call inside Router.
+            return self.router.get_from(endpoint, path, budget=budget)
+
+        started_at = self.router.clock()
+        try:
+            result = self.router.get_from(endpoint, path, budget=budget)
+        except DeadlineExceeded:
+            self._emit_observation(plan, site, started_at, "deadline")
+            raise
+        except Unavailable:
+            self._emit_observation(plan, site, started_at, "unavailable")
+            raise
+        else:
+            self._emit_observation(plan, site, started_at, "delivered")
+            return result
 
     # ------------------------------------------------------------------
     # Shared cached GET
@@ -481,8 +529,10 @@ class OutageRouter:
 
         primary, zone, backup = plan.by_bucket[bucket]
         if outage_zone is not None and outage_zone == zone:
+            site = backup
             endpoint = self._site_endpoint[backup]
         else:
+            site = primary
             endpoint = self._site_endpoint[primary]
 
         if language not in ("zh", "en"):
@@ -496,15 +546,28 @@ class OutageRouter:
 
         # The cached entry is still one router call for purposes of the
         # instance-wide 32-call limit.  Waiting therefore occupies a call slot
-        # but never an endpoint/origin slot.
-        deadline = self.router.clock() + budget
-        self.router._acquire_call_slot(path)
+        # but never an endpoint/origin slot.  Observation happens only after
+        # this outer finally has released that slot.
+        started_at = self.router.clock()
+        deadline = started_at + budget
+        result = None
         try:
-            identity = (bucket, endpoint, path, language)
-            return self._cached_wait_or_fetch(
-                identity, endpoint, path, language, deadline)
-        finally:
-            self.router._release_call_slot()
+            self.router._acquire_call_slot(path)
+            try:
+                identity = (bucket, endpoint, path, language)
+                result = self._cached_wait_or_fetch(
+                    identity, endpoint, path, language, deadline)
+            finally:
+                self.router._release_call_slot()
+        except DeadlineExceeded:
+            self._emit_observation(plan, site, started_at, "deadline")
+            raise
+        except Unavailable:
+            self._emit_observation(plan, site, started_at, "unavailable")
+            raise
+        else:
+            self._emit_observation(plan, site, started_at, "delivered")
+            return result
 
     def _cached_wait_or_fetch(self, identity, endpoint, path, language,
                               deadline):

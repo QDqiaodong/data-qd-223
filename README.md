@@ -134,11 +134,97 @@ status, body = gateway.get_cached(
   可在旧 endpoint token/套接字清理后接续。所有回源仍经过 `Router` 的真实 HTTP
   传输、尝试时限、每 endpoint 单尝试、32 调用上限和冷却规则；未另起后台刷新任务。
 
+## 调用归属观测
+
+`OutageRouter(router, sites, observe=sink)` 可附加一个被动观测回调；不传或传
+`None` 时完全保留原入口行为。回调由执行该次前台调用的线程同步调用，因此接收器
+需要自己保证线程安全。每次 `get` 或 `get_cached` 的有效调用恰好得到一条独立
+字典，且只有以下五个键：
+
+```python
+{
+    "revision": 2,          # 安排这次调用的已核准版本
+    "site": "east-1",       # 与 revision 来自同一份不可变计划
+    "completed_ms": 12345,  # floor(router.clock() * 1000)
+    "latency_ms": 42,       # 选站后到结果确定；向下取整，上限 1000
+    "outcome": "delivered", # delivered | deadline | unavailable
+}
+```
+
+- 任何合法 HTTP 响应（包括 404）都是 `delivered`；`DeadlineExceeded` 是
+  `deadline`；使用了计划但抛出 `Unavailable` 是 `unavailable`。
+- 无计划，或桶、故障区、语言、路径、预算等输入校验拒绝时，不产生记录。
+- 新鲜缓存命中也产生一条；多个前台调用共用一次回源时，仍按各自的最终结果各
+  产生一条。记录不包含路径、请求头或正文。
+- 版本和站点在调用开始时随本地计划快照固定；之后安装新版本不会改写在途调用
+  的归属。
+- 时间戳使用注入 `Router` 的同一个单调时钟。回调在结果确定、HTTP/socket/
+  endpoint 槽和 `OutageRouter` 调用槽均释放后执行。
+- 回调抛出普通 `Exception` 会被被动层吞掉，不能改变调用的返回值或原异常，也
+  不会触发重试。回调内若需长期工作，应自行快速入队，避免占用前台调用线程。
+
+## 事故重算：区分服务退化与采集断档
+
+`gateway_watch.evaluate(observations, *, origin_ms, duration_s, scopes, coverage)`
+可直接导入，仅使用标准库。它不会发网络通知、不会改转发决策，只返回
+`(windows, actions)` 两个列表。
+
+`origin_ms` 是本次单调时间轴上的绝对毫秒起点；`scopes`、`coverage`、窗口中的
+`end_ms` 和动作中的 `end_ms` 均使用相对该起点的毫秒坐标。例如
+`completed_ms=origin_ms+60500` 对应相对时刻 `60500`。
+
+```python
+from gateway_watch import evaluate
+
+windows, actions = evaluate(
+    observations,  # 一次性可迭代的归属字典；最多 2,000,000 条
+    origin_ms=1_732_000_000_000,
+    duration_s=600,                 # 60..3600，且为 10 的倍数
+    scopes={
+        (1, "east-1"): (0, 600_000),  # 端点为 10000 的倍数，长度 >=60000
+    },
+    coverage={
+        (1, "east-1"): [(0, 240_000), (240_000, 600_000)],  # 相接即完整
+    },
+)
+```
+
+窗口元组为：
+
+```python
+(revision, site, end_ms, count, failures, p95_ms, complete, verdict)
+```
+
+- 窗口是 `[end_ms-60000, end_ms)`，尾点从值班区间起点后的 `60000` 开始，每
+  `10000` 毫秒一个，直到值班区间右端点（含该尾点；右端样本不纳入）。
+- `count` 计入三种结果；`failures` 是 `deadline + unavailable`。
+- `p95_ms` 只统计 `delivered`，使用整数延迟上的精确最近秩
+  `ceil(0.95 * n)`；没有交付样本时为 `None`。
+- `coverage` 只能由采集方提供，不能从样本量推断。相接区间视为连续覆盖；只差
+  一毫秒也会使窗口 `complete=False`，判定为 `gap`。
+- 判定优先级是：不完整 → `gap`；完整但 `count < 20` → `low`；否则
+  `failures * 20 >= count`（失败率 ≥5%）或 `p95_ms >= 200` → `bad`；其余为
+  `good`。
+- 动作元组为 `(revision, site, end_ms, kind)`。连续两个 `bad` 发一次
+  `open_incident`，事故中连续两个 `good` 才发一次 `resolve_incident`；`low`
+  和 `gap` 都打断连续性，且 `gap/low` 不解除已开事故。第一个 `gap` 窗立即发
+  `open_gap`，之后第一个非 `gap` 窗发 `resolve_gap`（即使该窗是 `low`）。区间
+  结束时仍未结的事故或采集缺口不补发解除动作。
+- 窗口和动作均按 `(end_ms, revision, site)` 排序。聚合不依赖记录到达顺序。
+
+实现不保存全部原始记录：延迟只有 0–1000 的整数，因此使用紧凑的 32 位直方图和
+计数数组；最大 24 条序列、每条最长 3600 秒时，直方图约占 34 MB（约 33 MiB），
+可在 96 MiB `RLIMIT_AS` 子进程中流式处理 200 万条不可二次遍历的乱序生成记录。
+当前不需要临时文件；若调用方自行使用磁盘，应在成功或拒绝后清理自建文件。
+
 ## 运行
 
 Python 3.9+，仅标准库。演示在回环地址启动两个临时真实上游，测试不访问外网。
 `test_cache_gateway.py` 使用可控时钟和事件门闩覆盖缓存命中、条件 304、同批合并、
 私有 `no-store`、失败清理、128 条上限和截止时间接续。
+`test_observation_hook.py` 用真实回环、门闩和线程接收器核对跨版本迟完成归属、
+缓存样本、截止/不可用和回调异常；`test_gateway_watch.py` 覆盖手算窗口与值班状态，
+`test_gateway_watch_memory.py` 在 96 MiB 地址空间子进程中处理 200 万条记录。
 
 ```sh
 python3 -B -m unittest -v
