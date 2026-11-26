@@ -41,6 +41,53 @@ except Unavailable as exc:
 
 回归测试覆盖：预算超时停止慢速滴流并关闭连接且不进入冷却；并发下占用中的上游不被再次拨号；尝试超时后在预算内切换、冷却、冷却后的完整 404；受控时钟下的截止相等与迟到事件隔离；5xx 响应头阻塞时仍能切换；各类无效响应。
 
+## 不可变制品的流式字节范围
+
+`gateway_stream.open_stream(...)` 在截止模式 `Router` 之上按 64 KiB 清单块读取
+公开制品的一个字节范围。它只请求与 `[lo, hi)` 相交的完整块，逐块校验
+`SHA-256`，并只把该块与读取范围相交的非空片段交给调用方：
+
+```python
+from gateway_stream import open_stream
+from router import DeadlineExceeded, Router, Unavailable
+
+router = Router([("127.0.0.1", 8080), ("127.0.0.1", 8081)],
+                clock=time.monotonic, cooldown=5.0, timeout=0.5,
+                deadline_mode=True)
+
+with open_stream(
+    router,
+    "/artifacts/demo",
+    length=object_length,          # 1..128 MiB
+    sha256s=chunk_digests,          # ceil(length / 65536) 个小写十六进制摘要
+    replicas=[("127.0.0.1", 8080), ("127.0.0.1", 8081)],
+    lo=1024,
+    hi=70_000,
+    budget=10.0,                    # 从 open_stream 时起算的绝对预算
+) as stream:
+    try:
+        for piece in stream:
+            consumer.send(piece)    # 每段恰好是一个已验证块的相交部分
+    except DeadlineExceeded:
+        ...                         # 前缀仍有效，但整个范围未成功读完
+    except Unavailable:
+        ...                         # 预算未耗尽时，所有镜像都无法完成当前块
+```
+
+- `open_stream(...)` 只校验并快照参数，不发包；第一次 `next(stream)` 才访问上游。
+- 每个块发送 `Range: bytes=<块起点>-<块尾含尾下标>`，始终请求完整块；只接受
+  `206`、唯一且精确的 `Content-Range`、缺失或单值 `identity` 的
+  `Content-Encoding`、精确块长和匹配的整块摘要。不符响应沿用 `Router` 的单端点
+  协议失败与冷却规则，该块再按 `replicas` 顺序改试下一个已配置镜像。
+- 实现按需取块，同一流至多只有一个在网块，因此不会缓存整个制品；慢消费会形成
+  背压。已交付片段不会重取或重送。
+- `for` 正常耗尽，或最后一段之后再次 `next()` 得到 `StopIteration`，才算整个
+  `[lo, hi)` 成功读完。已经收到前缀后出现 `DeadlineExceeded` 或 `Unavailable`
+  时，前缀本身有效，但本次流不是成功完成；调用方不能把它当作完整范围，也不能
+  在原流上继续读取。需要续传时，应基于已确认消费的偏移另行打开新范围。
+- 读取失败、`close()` 或退出 `with` 后流永久终结，之后取值均为
+  `StopIteration`；重复 `close()` 无副作用。正常停读不会记为镜像故障。
+
 ## 单可用区故障接管
 
 `outage_router.OutageRouter(router, sites)` 在已按 `deadline_mode=True` 构造的
